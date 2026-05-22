@@ -1,0 +1,19 @@
+{
+  "type": "module",
+  "scripts": {
+    "build": "esbuild src/static/js/client-entry.js --bundle --format=esm --target=es2020 --outfile=src/static/js/main.js && esbuild src/static/js/game-entry.js --bundle --format=esm --target=es2020 --outfile=src/static/js/game.js",
+    "start": "npm run build && node src/server.js",
+    "dev": "nodemon --watch src -e js,html,css --exec \"npm run build && node src/server.js\""
+  },
+  "dependencies": {
+    "@geckos.io/client": "^3.1.0",
+    "@geckos.io/server": "^3.1.0",
+    "@geckos.io/snapshot-interpolation": "^1.1.1",
+    "@geckos.io/typed-array-buffer-schema": "^1.2.1",
+    "fastify": "^5.8.5"
+  },
+  "devDependencies": {
+    "esbuild": "^0.25.0",
+    "nodemon": "^3.1.14"
+  }
+}
