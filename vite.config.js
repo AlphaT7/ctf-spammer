@@ -1,4 +1,4 @@
-c export default {
+export default {
   root: "./client/",
   publicDir: "./client/static/",
   build: {

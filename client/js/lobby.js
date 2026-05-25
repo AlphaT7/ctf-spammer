@@ -87,7 +87,7 @@ channel.onConnect((error) => {
 
   isConnected = true;
   setLobbyActionsEnabled(true);
-  setStatus("CONNECTED", "--accent-green");
+  setStatus("SERVER CONNECTION ESTABLISHED", "--accent-green");
   channel.emit("request-game-list");
 });
 

@@ -31,10 +31,14 @@ const unitSpriteUrl = new URL("../images/units.sprite.png", import.meta.url)
   .href;
 const spriteSourceSize = vec2(41, 41);
 const spriteRenderSize = vec2(41, 41);
+const canvasSize = vec2(375, 630);
+LJS.setCanvasFixedSize(canvasSize);
 
 let spriteTexture;
 let sprites = [];
 let connectionReady = false;
+let latestGameState = null;
+let gameLive = false;
 
 class BaseSprite {
   constructor(sourcePos, renderPos) {
@@ -68,6 +72,18 @@ class BaseSprite {
   }
 }
 
+class PlayerFlagSprite extends BaseSprite {
+  constructor(renderPos) {
+    super(vec2(0, 82), renderPos);
+  }
+}
+
+class EnemyFlagSprite extends BaseSprite {
+  constructor(renderPos) {
+    super(vec2(41, 82), renderPos);
+  }
+}
+
 class PlayerFlagDefenderSprite extends BaseSprite {
   constructor(renderPos) {
     super(vec2(41, 41), renderPos);
@@ -78,22 +94,72 @@ function setOverlayMessage(message) {
   overlayContent.textContent = message;
 }
 
+function getOverlayMessage(state) {
+  if (!state) {
+    return "Connecting to match...";
+  }
+
+  if (state.phase === "waiting") {
+    return "Waiting for both players...";
+  }
+
+  if (state.phase === "countdown") {
+    const seconds = Number.isFinite(state.countdownRemaining)
+      ? state.countdownRemaining
+      : 0;
+    return `Match starts in ${seconds}s`;
+  }
+
+  if (state.phase === "live") {
+    return "";
+  }
+
+  return "Preparing match...";
+}
+
 function createDefenderSprite(position) {
   const sprite = new PlayerFlagDefenderSprite(vec2(position.x, position.y));
   sprite.createTileInfo(spriteTexture);
   return sprite;
 }
 
-function syncGameState(state) {
-  sprites = state.defenders.map((defender) =>
-    createDefenderSprite(defender.position),
+function createFlagSprites() {
+  const halfFlagHeight = spriteRenderSize.y / 2;
+  const topCenter = vec2(canvasSize.x / 2, halfFlagHeight + 5);
+  const bottomCenter = vec2(
+    canvasSize.x / 2,
+    canvasSize.y - halfFlagHeight - 5,
   );
+
+  const playerFlag = new PlayerFlagSprite(bottomCenter);
+  const enemyFlag = new EnemyFlagSprite(topCenter);
+
+  playerFlag.createTileInfo(spriteTexture);
+  enemyFlag.createTileInfo(spriteTexture);
+
+  return [enemyFlag, playerFlag];
+}
+
+function syncGameState(state) {
+  latestGameState = state;
   hudPlayers.textContent = String(state.players).padStart(2, "0");
   hudScore.textContent = String(state.defenders.length).padStart(4, "0");
+  gameLive = state.phase === "live";
 
   if (connectionReady) {
-    setOverlayMessage("");
+    setOverlayMessage(getOverlayMessage(state));
   }
+
+  if (!spriteTexture) {
+    return;
+  }
+
+  const flagSprites = gameLive ? createFlagSprites() : [];
+  const defenderSprites = state.defenders.map((defender) =>
+    createDefenderSprite(defender.position),
+  );
+
+  sprites = [...defenderSprites, ...flagSprites];
 }
 
 channel.on("game-state", (state) => {
@@ -145,10 +211,14 @@ function gameInit() {
 
   spriteTexture = LJS.textureInfos[0];
   sprites = [];
+
+  if (latestGameState) {
+    syncGameState(latestGameState);
+  }
 }
 
 function gameUpdate() {
-  if (!connectionReady) {
+  if (!connectionReady || !gameLive) {
     return;
   }
 
@@ -164,13 +234,13 @@ function gameUpdate() {
 
 function gameUpdatePost() {}
 
-function gameRender() {}
-
-function gameRenderPost() {
+function gameRender() {
   for (const sprite of sprites) {
     sprite.render();
   }
 }
+
+function gameRenderPost() {}
 
 LJS.engineInit(
   gameInit,

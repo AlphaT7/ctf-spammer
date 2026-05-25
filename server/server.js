@@ -4,8 +4,12 @@ import http from "http";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN ?? "*";
-const DEFAULT_MAX_PLAYERS = 4;
-const MAX_MAX_PLAYERS = 8;
+const DEFAULT_MAX_PLAYERS = 2;
+const MAX_MAX_PLAYERS = 2;
+const MIN_PLAYERS_TO_START = 2;
+const PRE_GAME_COUNTDOWN_SECONDS = 3;
+const CANVAS_WIDTH = 375;
+const CANVAS_HEIGHT = 630;
 
 const server = http.createServer();
 
@@ -86,6 +90,8 @@ function createGameId() {
 function createGameState() {
   return {
     defenders: [],
+    phase: "waiting",
+    countdownRemaining: null,
     updatedAt: now(),
   };
 }
@@ -103,35 +109,53 @@ function serializeGameListItem(game) {
     id: game.id,
     name: game.name,
     host: game.host,
+    hostPlayerId: game.hostPlayerId,
     players: game.players.size,
     maxPlayers: game.maxPlayers,
+    phase: game.state.phase,
+    countdownRemaining: game.state.countdownRemaining,
     createdAt: game.createdAt,
   };
 }
 
-function serializeGameState(game) {
+function mirrorPosition(position) {
+  return {
+    x: CANVAS_WIDTH - Number(position.x),
+    y: CANVAS_HEIGHT - Number(position.y),
+  };
+}
+
+function serializeGameState(game, viewerPlayerId = null) {
+  const isGuestPerspective =
+    viewerPlayerId && game.hostPlayerId && viewerPlayerId !== game.hostPlayerId;
+
   return {
     gameId: game.id,
+    hostPlayerId: game.hostPlayerId,
     defenders: game.state.defenders.map((defender) => ({
       id: defender.id,
       ownerId: defender.ownerId,
-      position: {
-        x: defender.position.x,
-        y: defender.position.y,
-      },
+      position: isGuestPerspective
+        ? mirrorPosition(defender.position)
+        : {
+            x: defender.position.x,
+            y: defender.position.y,
+          },
       createdAt: defender.createdAt,
     })),
     players: game.players.size,
     maxPlayers: game.maxPlayers,
+    phase: game.state.phase,
+    countdownRemaining: game.state.countdownRemaining,
     updatedAt: game.state.updatedAt,
   };
 }
 
-function serializeGameDetails(game) {
+function serializeGameDetails(game, viewerPlayerId = null) {
   return {
     ...serializeGameListItem(game),
     playerList: Array.from(game.players.values(), serializePlayer),
-    state: serializeGameState(game),
+    state: serializeGameState(game, viewerPlayerId),
   };
 }
 
@@ -144,7 +168,84 @@ function broadcastGameList() {
 }
 
 function emitGameState(game) {
-  io.room(game.id).emit("game-state", serializeGameState(game));
+  for (const player of game.players.values()) {
+    player.channel.emit("game-state", serializeGameState(game, player.id));
+  }
+}
+
+function clearCountdownTimer(game) {
+  if (game.countdownDelayTimer) {
+    clearTimeout(game.countdownDelayTimer);
+    game.countdownDelayTimer = null;
+  }
+
+  if (game.countdownIntervalTimer) {
+    clearInterval(game.countdownIntervalTimer);
+    game.countdownIntervalTimer = null;
+  }
+}
+
+function setGamePhase(game, phase, countdownRemaining) {
+  game.state.phase = phase;
+  game.state.countdownRemaining = countdownRemaining;
+  touchGameState(game);
+}
+
+function updateGameReadiness(game) {
+  if (game.players.size < MIN_PLAYERS_TO_START) {
+    clearCountdownTimer(game);
+
+    if (
+      game.state.phase !== "waiting" ||
+      game.state.countdownRemaining !== null
+    ) {
+      setGamePhase(game, "waiting", null);
+      emitGameState(game);
+    }
+    return;
+  }
+
+  if (game.state.phase === "live") {
+    return;
+  }
+
+  if (game.countdownDelayTimer || game.countdownIntervalTimer) {
+    return;
+  }
+
+  setGamePhase(game, "waiting", null);
+  emitGameState(game);
+
+  game.countdownDelayTimer = setTimeout(() => {
+    game.countdownDelayTimer = null;
+
+    if (!games.has(game.id) || game.players.size < MIN_PLAYERS_TO_START) {
+      return;
+    }
+
+    let remaining = PRE_GAME_COUNTDOWN_SECONDS;
+    setGamePhase(game, "countdown", remaining);
+    emitGameState(game);
+
+    game.countdownIntervalTimer = setInterval(() => {
+      if (!games.has(game.id) || game.players.size < MIN_PLAYERS_TO_START) {
+        clearCountdownTimer(game);
+        return;
+      }
+
+      remaining -= 1;
+
+      if (remaining <= 0) {
+        clearCountdownTimer(game);
+        setGamePhase(game, "live", 0);
+        emitGameState(game);
+        return;
+      }
+
+      setGamePhase(game, "countdown", remaining);
+      emitGameState(game);
+    }, 1000);
+  }, 1000);
 }
 
 function createGame(payload = {}) {
@@ -154,10 +255,13 @@ function createGame(payload = {}) {
     id: createGameId(),
     name: normalizeString(safePayload.name, `GAME-${nextGameNumber++}`),
     host: normalizeString(safePayload.host, "Host"),
+    hostPlayerId: null,
     maxPlayers: normalizeMaxPlayers(safePayload.maxPlayers),
     createdAt: now(),
     players: new Map(),
     state: createGameState(),
+    countdownDelayTimer: null,
+    countdownIntervalTimer: null,
   };
 
   games.set(game.id, game);
@@ -199,10 +303,18 @@ function removeChannelFromGame(channel) {
   game.players.delete(channel.id);
 
   if (game.players.size === 0) {
+    clearCountdownTimer(game);
     games.delete(gameId);
   } else {
+    if (game.hostPlayerId === channel.id) {
+      const nextHost = game.players.values().next().value;
+      game.hostPlayerId = nextHost?.id ?? null;
+      game.host = nextHost?.name ?? "Host";
+    }
+
     touchGameState(game);
     emitGameState(game);
+    updateGameReadiness(game);
   }
 
   broadcastGameList();
@@ -239,15 +351,25 @@ function joinGameInstance(channel, payload = {}) {
   player.channel = channel;
 
   game.players.set(channel.id, player);
+
+  if (!game.hostPlayerId) {
+    game.hostPlayerId = channel.id;
+  }
+
+  if (game.hostPlayerId === channel.id) {
+    game.host = player.name;
+  }
+
   channel.join(game.id);
   channel.userData.gameId = game.id;
 
   touchGameState(game);
+  updateGameReadiness(game);
 
   channel.emit("game-joined", {
     id: game.id,
     name: game.name,
-    game: serializeGameDetails(game),
+    game: serializeGameDetails(game, channel.id),
     playerId: channel.id,
   });
 
@@ -264,6 +386,11 @@ function addDefender(channel, payload = {}) {
     return;
   }
 
+  if (game.state.phase !== "live") {
+    channel.emit("game-error", { message: "Match has not started yet" });
+    return;
+  }
+
   const x = Number(safePayload.position?.x);
   const y = Number(safePayload.position?.y);
 
@@ -272,10 +399,16 @@ function addDefender(channel, payload = {}) {
     return;
   }
 
+  const playerIsGuest =
+    game.hostPlayerId !== null && channel.id !== game.hostPlayerId;
+  const canonicalPosition = playerIsGuest
+    ? mirrorPosition({ x, y })
+    : { x, y };
+
   game.state.defenders.push({
     id: "DEF-" + Math.random().toString(36).substring(2, 10).toUpperCase(),
     ownerId: channel.id,
-    position: { x, y },
+    position: canonicalPosition,
     createdAt: now(),
   });
 
@@ -373,14 +506,15 @@ io.onConnection((channel) => {
   });
 
   channel.on("request-game-state", (payload) => {
-    const requestedGame = getGame(payload?.gameId) ?? getGame(channel.userData?.gameId);
+    const requestedGame =
+      getGame(payload?.gameId) ?? getGame(channel.userData?.gameId);
 
     if (!requestedGame) {
       channel.emit("game-error", { message: "Game not found" });
       return;
     }
 
-    channel.emit("game-state", serializeGameState(requestedGame));
+    channel.emit("game-state", serializeGameState(requestedGame, channel.id));
   });
 
   channel.on("place-defender", (payload) => {
