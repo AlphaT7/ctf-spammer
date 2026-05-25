@@ -1,0 +1,52 @@
+export class SpriteTemplate {
+  constructor() {
+    this.sprite = {
+      image: new Image(),
+      sx: Number,
+      sy: Number,
+      sw: Number,
+      sh: Number,
+      dx: Number,
+      dy: Number,
+      dw: Number,
+      dh: Number,
+      x: Number,
+      y: Number,
+      speed: Number,
+      active: false,
+    };
+  }
+
+  render(ctx) {
+    ctx.drawImage(
+      this.sprite.image,
+      this.sprite.sx,
+      this.sprite.sy,
+      this.sprite.sw,
+      this.sprite.sh,
+      this.sprite.dx + this.sprite.x,
+      this.sprite.dy + this.sprite.y,
+      this.sprite.dw,
+      this.sprite.dh,
+    );
+  }
+}
+
+export class PlayerFlagSeeker extends SpriteTemplate {
+  constructor() {
+    super();
+    this.sprite.image.src = "/img/units.sprite.png";
+    this.sprite.sx = 0;
+    this.sprite.sy = 0;
+    this.sprite.sw = 16;
+    this.sprite.sh = 16;
+    this.sprite.dx = 0;
+    this.sprite.dy = 0;
+    this.sprite.dw = 16;
+    this.sprite.dh = 16;
+  }
+
+  sprite() {
+    return this.sprite;
+  }
+}
