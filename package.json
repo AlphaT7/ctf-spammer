@@ -1,19 +1,24 @@
 {
   "type": "module",
   "scripts": {
-    "build": "esbuild src/static/js/client-entry.js --bundle --format=esm --target=es2020 --outfile=src/static/js/main.js && esbuild src/static/js/game-entry.js --bundle --format=esm --target=es2020 --outfile=src/static/js/game.js",
-    "start": "npm run build && node src/server.js",
-    "dev": "nodemon --watch src -e js,html,css --exec \"npm run build && node src/server.js\""
+    "build": "vite build",
+    "build:client": "vite build",
+    "dev": "npm run dev:server",
+    "dev:client": "vite",
+    "dev:server": "nodemon --watch server -e js,json --exec \"node server/server.js\"",
+    "start": "npm run start:server",
+    "start:server": "node server/server.js"
   },
   "dependencies": {
     "@geckos.io/client": "^3.1.0",
     "@geckos.io/server": "^3.1.0",
     "@geckos.io/snapshot-interpolation": "^1.1.1",
     "@geckos.io/typed-array-buffer-schema": "^1.2.1",
-    "fastify": "^5.8.5"
+    "fastify": "^5.8.5",
+    "littlejsengine": "^1.18.12"
   },
   "devDependencies": {
-    "esbuild": "^0.25.0",
-    "nodemon": "^3.1.14"
+    "nodemon": "^3.1.14",
+    "vite": "^8.0.14"
   }
 }
