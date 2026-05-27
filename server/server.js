@@ -135,6 +135,7 @@ function serializeGameState(game, viewerPlayerId = null) {
     defenders: game.state.defenders.map((defender) => ({
       id: defender.id,
       ownerId: defender.ownerId,
+      unitType: defender.unitType ?? "defender",
       position: isGuestPerspective
         ? mirrorPosition(defender.position)
         : {
@@ -393,6 +394,9 @@ function addDefender(channel, payload = {}) {
 
   const x = Number(safePayload.position?.x);
   const y = Number(safePayload.position?.y);
+  const requestedUnitType = normalizeString(safePayload.unitType, "defender");
+  const unitType =
+    requestedUnitType === "flagSeeker" ? "flagSeeker" : "defender";
 
   if (!Number.isFinite(x) || !Number.isFinite(y)) {
     channel.emit("game-error", { message: "Invalid defender position" });
@@ -408,6 +412,7 @@ function addDefender(channel, payload = {}) {
   game.state.defenders.push({
     id: "DEF-" + Math.random().toString(36).substring(2, 10).toUpperCase(),
     ownerId: channel.id,
+    unitType,
     position: canonicalPosition,
     createdAt: now(),
   });

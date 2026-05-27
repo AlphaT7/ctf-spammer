@@ -29,9 +29,13 @@ const geckosOptions = serverUrl
 const channel = geckos(geckosOptions);
 const unitSpriteUrl = new URL("../images/units.sprite.png", import.meta.url)
   .href;
-const spriteSourceSize = vec2(41, 41);
-const spriteRenderSize = vec2(41, 41);
+const spriteSourceSize = vec2(40, 40);
+const spriteRenderSize = vec2(40, 40);
 const canvasSize = vec2(375, 630);
+const LONG_CLICK_MS = 300;
+const LONG_CLICK_MOVE_TOLERANCE = 8;
+LJS.setShowSplashScreen(false);
+LJS.setDebugWatermark(false);
 LJS.setCanvasFixedSize(canvasSize);
 
 let spriteTexture;
@@ -39,6 +43,18 @@ let sprites = [];
 let connectionReady = false;
 let latestGameState = null;
 let gameLive = false;
+let currentPlayerId = null;
+let pressStartTimeMs = null;
+let pressStartPosition = null;
+let longClickHandled = false;
+const unitSpriteMap = {
+  playerFlag: vec2(0, 80),
+  enemyFlag: vec2(40, 80),
+  playerFlagDefender: vec2(40, 0),
+  enemyFlagDefender: vec2(0, 40),
+  playerFlagSeeker: vec2(40, 40),
+  enemyFlagSeeker: vec2(0, 0),
+};
 
 class BaseSprite {
   constructor(sourcePos, renderPos) {
@@ -74,19 +90,37 @@ class BaseSprite {
 
 class PlayerFlagSprite extends BaseSprite {
   constructor(renderPos) {
-    super(vec2(0, 82), renderPos);
+    super(unitSpriteMap.playerFlag, renderPos);
   }
 }
 
 class EnemyFlagSprite extends BaseSprite {
   constructor(renderPos) {
-    super(vec2(41, 82), renderPos);
+    super(unitSpriteMap.enemyFlag, renderPos);
   }
 }
 
 class PlayerFlagDefenderSprite extends BaseSprite {
   constructor(renderPos) {
-    super(vec2(41, 41), renderPos);
+    super(unitSpriteMap.playerFlagDefender, renderPos);
+  }
+}
+
+class EnemyFlagDefenderSprite extends BaseSprite {
+  constructor(renderPos) {
+    super(unitSpriteMap.enemyFlagDefender, renderPos);
+  }
+}
+
+class PlayerFlagSeekerSprite extends BaseSprite {
+  constructor(renderPos) {
+    super(unitSpriteMap.playerFlagSeeker, renderPos);
+  }
+}
+
+class EnemyFlagSeekerSprite extends BaseSprite {
+  constructor(renderPos) {
+    super(unitSpriteMap.enemyFlagSeeker, renderPos);
   }
 }
 
@@ -117,10 +151,82 @@ function getOverlayMessage(state) {
   return "Preparing match...";
 }
 
-function createDefenderSprite(position) {
-  const sprite = new PlayerFlagDefenderSprite(vec2(position.x, position.y));
+function createPlacedUnitSprite(defender) {
+  const position = vec2(defender.position.x, defender.position.y);
+  const isOwnedByCurrentPlayer =
+    currentPlayerId !== null && defender.ownerId === currentPlayerId;
+  const isFlagSeeker = defender.unitType === "flagSeeker";
+
+  let sprite;
+
+  if (isFlagSeeker) {
+    sprite = isOwnedByCurrentPlayer
+      ? new PlayerFlagSeekerSprite(position)
+      : new EnemyFlagSeekerSprite(position);
+  } else {
+    sprite = isOwnedByCurrentPlayer
+      ? new PlayerFlagDefenderSprite(position)
+      : new EnemyFlagDefenderSprite(position);
+  }
+
   sprite.createTileInfo(spriteTexture);
   return sprite;
+}
+
+function clearPressState() {
+  pressStartTimeMs = null;
+  pressStartPosition = null;
+  longClickHandled = false;
+}
+
+function distanceSquared(a, b) {
+  const dx = Number(a.x) - Number(b.x);
+  const dy = Number(a.y) - Number(b.y);
+  return dx * dx + dy * dy;
+}
+
+function longClick() {
+  if (
+    pressStartTimeMs === null ||
+    pressStartPosition === null ||
+    longClickHandled ||
+    !LJS.mouseIsDown(0)
+  ) {
+    return null;
+  }
+
+  const elapsedMs = performance.now() - pressStartTimeMs;
+  const movedDistanceSquared = distanceSquared(
+    pressStartPosition,
+    LJS.mousePosScreen,
+  );
+  const moveToleranceSquared =
+    LONG_CLICK_MOVE_TOLERANCE * LONG_CLICK_MOVE_TOLERANCE;
+
+  if (movedDistanceSquared > moveToleranceSquared) {
+    clearPressState();
+    return null;
+  }
+
+  if (elapsedMs < LONG_CLICK_MS) {
+    return null;
+  }
+
+  longClickHandled = true;
+  return {
+    x: pressStartPosition.x,
+    y: pressStartPosition.y,
+  };
+}
+
+function emitUnitPlacement(unitType, position) {
+  channel.emit("place-defender", {
+    unitType,
+    position: {
+      x: position.x,
+      y: position.y,
+    },
+  });
 }
 
 function createFlagSprites() {
@@ -156,7 +262,7 @@ function syncGameState(state) {
 
   const flagSprites = gameLive ? createFlagSprites() : [];
   const defenderSprites = state.defenders.map((defender) =>
-    createDefenderSprite(defender.position),
+    createPlacedUnitSprite(defender),
   );
 
   sprites = [...defenderSprites, ...flagSprites];
@@ -167,6 +273,7 @@ channel.on("game-state", (state) => {
 });
 
 channel.on("game-joined", (payload) => {
+  currentPlayerId = payload.playerId ?? currentPlayerId;
   syncGameState(payload.game.state);
 });
 
@@ -219,16 +326,33 @@ function gameInit() {
 
 function gameUpdate() {
   if (!connectionReady || !gameLive) {
+    clearPressState();
     return;
   }
 
+  if (LJS.mouseWasPressed(0)) {
+    pressStartTimeMs = performance.now();
+    pressStartPosition = {
+      x: LJS.mousePosScreen.x,
+      y: LJS.mousePosScreen.y,
+    };
+    longClickHandled = false;
+  }
+
+  const longClickPosition = longClick();
+  if (longClickPosition) {
+    emitUnitPlacement("flagSeeker", longClickPosition);
+  }
+
   if (LJS.mouseWasReleased(0)) {
-    channel.emit("place-defender", {
-      position: {
+    if (!longClickHandled && pressStartPosition) {
+      emitUnitPlacement("defender", {
         x: LJS.mousePosScreen.x,
         y: LJS.mousePosScreen.y,
-      },
-    });
+      });
+    }
+
+    clearPressState();
   }
 }
 
