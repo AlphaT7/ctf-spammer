@@ -1,7 +1,19 @@
 "use strict";
 
 import geckos from "@geckos.io/client";
+import { SnapshotInterpolation } from "@geckos.io/snapshot-interpolation";
 import * as LJS from "littlejsengine";
+import {
+  ARENA_HEIGHT,
+  ARENA_WIDTH,
+  PLAYER_SLOT_NONE,
+  SNAPSHOT_SERVER_FPS,
+  decodeGameSnapshot,
+  getGuestFlagPosition,
+  getHostFlagPosition,
+  isDefenderEntity,
+  isMatchEntity,
+} from "../../shared/game-snapshot.js";
 
 const { rgb, vec2 } = LJS;
 
@@ -31,7 +43,7 @@ const unitSpriteUrl = new URL("../images/units.sprite.png", import.meta.url)
   .href;
 const spriteSourceSize = vec2(40, 40);
 const spriteRenderSize = vec2(40, 40);
-const canvasSize = vec2(375, 630);
+const canvasSize = vec2(ARENA_WIDTH, ARENA_HEIGHT);
 const LONG_CLICK_MS = 300;
 const LONG_CLICK_MOVE_TOLERANCE = 8;
 LJS.setShowSplashScreen(false);
@@ -41,12 +53,13 @@ LJS.setCanvasFixedSize(canvasSize);
 let spriteTexture;
 let sprites = [];
 let connectionReady = false;
-let latestGameState = null;
+let latestSnapshotState = null;
 let gameLive = false;
-let currentPlayerId = null;
+let currentPlayerSlot = PLAYER_SLOT_NONE;
 let pressStartTimeMs = null;
 let pressStartPosition = null;
 let longClickHandled = false;
+const snapshotInterpolation = new SnapshotInterpolation(SNAPSHOT_SERVER_FPS);
 const unitSpriteMap = {
   playerFlag: vec2(0, 80),
   enemyFlag: vec2(40, 80),
@@ -152,9 +165,10 @@ function getOverlayMessage(state) {
 }
 
 function createPlacedUnitSprite(defender) {
-  const position = vec2(defender.position.x, defender.position.y);
+  const position = vec2(defender.x, defender.y);
   const isOwnedByCurrentPlayer =
-    currentPlayerId !== null && defender.ownerId === currentPlayerId;
+    currentPlayerSlot !== PLAYER_SLOT_NONE &&
+    defender.ownerSlot === currentPlayerSlot;
   const isFlagSeeker = defender.unitType === "flagSeeker";
 
   let sprite;
@@ -230,11 +244,13 @@ function emitUnitPlacement(unitType, position) {
 }
 
 function createFlagSprites() {
-  const halfFlagHeight = spriteRenderSize.y / 2;
-  const topCenter = vec2(canvasSize.x / 2, halfFlagHeight + 5);
+  const topCenter = vec2(
+    getGuestFlagPosition().x,
+    getGuestFlagPosition().y,
+  );
   const bottomCenter = vec2(
-    canvasSize.x / 2,
-    canvasSize.y - halfFlagHeight - 5,
+    getHostFlagPosition().x,
+    getHostFlagPosition().y,
   );
 
   const playerFlag = new PlayerFlagSprite(bottomCenter);
@@ -246,14 +262,32 @@ function createFlagSprites() {
   return [enemyFlag, playerFlag];
 }
 
-function syncGameState(state) {
-  latestGameState = state;
-  hudPlayers.textContent = String(state.players).padStart(2, "0");
-  hudScore.textContent = String(state.defenders.length).padStart(4, "0");
-  gameLive = state.phase === "live";
+function getMatchState(state) {
+  return state.find((entity) => isMatchEntity(entity)) ?? null;
+}
+
+function getDefenderState(state) {
+  return state.filter((entity) => isDefenderEntity(entity));
+}
+
+function syncRealtimeState(state) {
+  latestSnapshotState = state;
+
+  const matchState = getMatchState(state);
+  const defenders = getDefenderState(state);
+
+  if (matchState?.ownerSlot !== undefined) {
+    currentPlayerSlot = matchState.ownerSlot;
+  }
+
+  hudPlayers.textContent = String(matchState?.players ?? 0).padStart(2, "0");
+  hudScore.textContent = String(defenders.length).padStart(4, "0");
+  gameLive = matchState?.phase === "live";
 
   if (connectionReady) {
-    setOverlayMessage(getOverlayMessage(state));
+    setOverlayMessage(
+      matchState ? getOverlayMessage(matchState) : "Preparing match...",
+    );
   }
 
   if (!spriteTexture) {
@@ -261,20 +295,22 @@ function syncGameState(state) {
   }
 
   const flagSprites = gameLive ? createFlagSprites() : [];
-  const defenderSprites = state.defenders.map((defender) =>
+  const defenderSprites = defenders.map((defender) =>
     createPlacedUnitSprite(defender),
   );
 
   sprites = [...defenderSprites, ...flagSprites];
 }
 
-channel.on("game-state", (state) => {
-  syncGameState(state);
+channel.onRaw((buffer) => {
+  const snapshot = decodeGameSnapshot(buffer);
+  syncRealtimeState(snapshot.state);
+  snapshotInterpolation.snapshot.add(snapshot);
 });
 
 channel.on("game-joined", (payload) => {
-  currentPlayerId = payload.playerId ?? currentPlayerId;
-  syncGameState(payload.game.state);
+  currentPlayerSlot = payload.playerSlot ?? currentPlayerSlot;
+  setOverlayMessage("Joining match...");
 });
 
 channel.on("join-error", (payload) => {
@@ -287,6 +323,10 @@ channel.on("game-error", (payload) => {
 
 channel.onDisconnect(() => {
   connectionReady = false;
+  currentPlayerSlot = PLAYER_SLOT_NONE;
+  latestSnapshotState = null;
+  sprites = [];
+  snapshotInterpolation.vault.clear();
   setOverlayMessage("Disconnected from server");
 });
 
@@ -319,12 +359,20 @@ function gameInit() {
   spriteTexture = LJS.textureInfos[0];
   sprites = [];
 
-  if (latestGameState) {
-    syncGameState(latestGameState);
+  if (latestSnapshotState) {
+    syncRealtimeState(latestSnapshotState);
   }
 }
 
 function gameUpdate() {
+  const interpolatedSnapshot = snapshotInterpolation.calcInterpolation("x y");
+
+  if (interpolatedSnapshot) {
+    syncRealtimeState(interpolatedSnapshot.state);
+  } else if (latestSnapshotState) {
+    syncRealtimeState(latestSnapshotState);
+  }
+
   if (!connectionReady || !gameLive) {
     clearPressState();
     return;

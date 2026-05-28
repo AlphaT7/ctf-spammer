@@ -1,6 +1,29 @@
 import Fastify from "fastify";
+import { SnapshotInterpolation } from "@geckos.io/snapshot-interpolation";
 import { geckos, iceServers } from "@geckos.io/server";
 import http from "http";
+import PF from "pathfinding";
+import {
+  ARENA_HEIGHT,
+  ARENA_WIDTH,
+  COUNTDOWN_NONE,
+  ENTITY_KIND_DEFENDER,
+  ENTITY_KIND_MATCH,
+  FLAG_SEEKER_SPEED,
+  MATCH_ENTITY_ID,
+  PATH_GRID_CELL_SIZE,
+  PLAYER_SLOT_GUEST,
+  PLAYER_SLOT_HOST,
+  PLAYER_SLOT_NONE,
+  SNAPSHOT_SERVER_FPS,
+  UNIT_TYPE_NONE,
+  encodeCountdown,
+  encodePhase,
+  encodeUnitType,
+  gameSnapshotModel,
+  getGuestFlagPosition,
+  getHostFlagPosition,
+} from "../shared/game-snapshot.js";
 
 const PORT = Number(process.env.PORT ?? 3000);
 const CLIENT_ORIGIN = process.env.CLIENT_ORIGIN ?? "*";
@@ -8,10 +31,17 @@ const DEFAULT_MAX_PLAYERS = 2;
 const MAX_MAX_PLAYERS = 2;
 const MIN_PLAYERS_TO_START = 2;
 const PRE_GAME_COUNTDOWN_SECONDS = 3;
-const CANVAS_WIDTH = 375;
-const CANVAS_HEIGHT = 630;
+const SNAPSHOT_INTERVAL_MS = Math.max(1, Math.floor(1000 / SNAPSHOT_SERVER_FPS));
+const PATH_GRID_COLUMNS = Math.ceil(ARENA_WIDTH / PATH_GRID_CELL_SIZE);
+const PATH_GRID_ROWS = Math.ceil(ARENA_HEIGHT / PATH_GRID_CELL_SIZE);
+const pathFinder = new PF.AStarFinder({
+  allowDiagonal: true,
+  dontCrossCorners: true,
+  heuristic: PF.Heuristic.octile,
+});
 
 const server = http.createServer();
+const snapshotInterpolation = new SnapshotInterpolation();
 
 const app = Fastify({
   logger: true,
@@ -120,8 +150,8 @@ function serializeGameListItem(game) {
 
 function mirrorPosition(position) {
   return {
-    x: CANVAS_WIDTH - Number(position.x),
-    y: CANVAS_HEIGHT - Number(position.y),
+    x: ARENA_WIDTH - Number(position.x),
+    y: ARENA_HEIGHT - Number(position.y),
   };
 }
 
@@ -160,6 +190,242 @@ function serializeGameDetails(game, viewerPlayerId = null) {
   };
 }
 
+function getPlayerSlot(game, playerId) {
+  if (!playerId) {
+    return PLAYER_SLOT_NONE;
+  }
+
+  return game.hostPlayerId === playerId ? PLAYER_SLOT_HOST : PLAYER_SLOT_GUEST;
+}
+
+function createMatchSnapshotEntity(game, viewerPlayerId = null) {
+  return {
+    id: MATCH_ENTITY_ID,
+    kind: ENTITY_KIND_MATCH,
+    ownerSlot: getPlayerSlot(game, viewerPlayerId),
+    unitType: UNIT_TYPE_NONE,
+    players: game.players.size,
+    maxPlayers: game.maxPlayers,
+    phase: encodePhase(game.state.phase),
+    countdownRemaining: encodeCountdown(game.state.countdownRemaining),
+    x: 0,
+    y: 0,
+  };
+}
+
+function createDefenderSnapshotEntity(game, defender, viewerPlayerId = null) {
+  const isGuestPerspective =
+    viewerPlayerId && game.hostPlayerId && viewerPlayerId !== game.hostPlayerId;
+  const position = isGuestPerspective
+    ? mirrorPosition(defender.position)
+    : {
+        x: defender.position.x,
+        y: defender.position.y,
+      };
+
+  return {
+    id: defender.id,
+    kind: ENTITY_KIND_DEFENDER,
+    ownerSlot: getPlayerSlot(game, defender.ownerId),
+    unitType: encodeUnitType(defender.unitType),
+    players: 0,
+    maxPlayers: 0,
+    phase: 0,
+    countdownRemaining: COUNTDOWN_NONE,
+    x: position.x,
+    y: position.y,
+  };
+}
+
+function createGameSnapshot(game, viewerPlayerId = null) {
+  return snapshotInterpolation.snapshot.create([
+    createMatchSnapshotEntity(game, viewerPlayerId),
+    ...game.state.defenders.map((defender) =>
+      createDefenderSnapshotEntity(game, defender, viewerPlayerId),
+    ),
+  ]);
+}
+
+function emitGameSnapshotToChannel(channel, game, viewerPlayerId = null) {
+  const buffer = gameSnapshotModel.toBuffer(
+    createGameSnapshot(game, viewerPlayerId),
+  );
+
+  channel.raw.emit(buffer);
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function worldToGrid(position) {
+  return {
+    x: clamp(
+      Math.round(Number(position.x) / PATH_GRID_CELL_SIZE),
+      0,
+      PATH_GRID_COLUMNS - 1,
+    ),
+    y: clamp(
+      Math.round(Number(position.y) / PATH_GRID_CELL_SIZE),
+      0,
+      PATH_GRID_ROWS - 1,
+    ),
+  };
+}
+
+function gridToWorld(cell) {
+  return {
+    x: clamp(cell[0] * PATH_GRID_CELL_SIZE, 0, ARENA_WIDTH),
+    y: clamp(cell[1] * PATH_GRID_CELL_SIZE, 0, ARENA_HEIGHT),
+  };
+}
+
+function getTargetFlagPositionForPlayer(game, ownerId) {
+  return getPlayerSlot(game, ownerId) === PLAYER_SLOT_HOST
+    ? getGuestFlagPosition()
+    : getHostFlagPosition();
+}
+
+function buildPathGrid(game, currentSeekerId = null) {
+  const grid = new PF.Grid(PATH_GRID_COLUMNS, PATH_GRID_ROWS);
+
+  for (const defender of game.state.defenders) {
+    if (defender.id === currentSeekerId || defender.unitType === "flagSeeker") {
+      continue;
+    }
+
+    const cell = worldToGrid(defender.position);
+    grid.setWalkableAt(cell.x, cell.y, false);
+  }
+
+  return grid;
+}
+
+function buildWorldPath(game, defender) {
+  const startCell = worldToGrid(defender.position);
+  const targetCell = worldToGrid(defender.targetPosition);
+  const grid = buildPathGrid(game, defender.id);
+
+  grid.setWalkableAt(startCell.x, startCell.y, true);
+  grid.setWalkableAt(targetCell.x, targetCell.y, true);
+
+  const rawPath = pathFinder.findPath(
+    startCell.x,
+    startCell.y,
+    targetCell.x,
+    targetCell.y,
+    grid,
+  );
+
+  if (rawPath.length === 0) {
+    return [];
+  }
+
+  const compressedPath = PF.Util.compressPath(rawPath);
+  const worldPath = compressedPath.slice(1).map((cell) => gridToWorld(cell));
+
+  if (worldPath.length === 0) {
+    return [
+      {
+        x: defender.targetPosition.x,
+        y: defender.targetPosition.y,
+      },
+    ];
+  }
+
+  worldPath[worldPath.length - 1] = {
+    x: defender.targetPosition.x,
+    y: defender.targetPosition.y,
+  };
+
+  return worldPath;
+}
+
+function recalculateFlagSeekerPaths(game) {
+  for (const defender of game.state.defenders) {
+    if (defender.unitType !== "flagSeeker") {
+      continue;
+    }
+
+    defender.path = buildWorldPath(game, defender);
+    defender.pathIndex = 0;
+  }
+}
+
+function moveFlagSeekers(game, deltaSeconds) {
+  if (game.state.phase !== "live") {
+    return false;
+  }
+
+  let moved = false;
+  const maxStepDistance = FLAG_SEEKER_SPEED * deltaSeconds;
+
+  for (const defender of game.state.defenders) {
+    if (defender.unitType !== "flagSeeker" || !defender.targetPosition) {
+      continue;
+    }
+
+    if (!Array.isArray(defender.path) || defender.path.length === 0) {
+      defender.path = buildWorldPath(game, defender);
+      defender.pathIndex = 0;
+    }
+
+    if (!Array.isArray(defender.path) || defender.path.length === 0) {
+      continue;
+    }
+
+    if (!Number.isInteger(defender.pathIndex) || defender.pathIndex < 0) {
+      defender.pathIndex = 0;
+    }
+
+    const currentWaypoint = defender.path[defender.pathIndex];
+    if (!currentWaypoint) {
+      continue;
+    }
+
+    const dx = currentWaypoint.x - defender.position.x;
+    const dy = currentWaypoint.y - defender.position.y;
+    const distance = Math.hypot(dx, dy);
+
+    if (distance === 0) {
+      if (defender.pathIndex < defender.path.length - 1) {
+        defender.pathIndex += 1;
+      } else {
+        defender.pathIndex = defender.path.length;
+      }
+      continue;
+    }
+
+    if (distance <= maxStepDistance) {
+      defender.position = {
+        x: currentWaypoint.x,
+        y: currentWaypoint.y,
+      };
+      moved = true;
+
+      if (defender.pathIndex < defender.path.length - 1) {
+        defender.pathIndex += 1;
+      } else {
+        defender.pathIndex = defender.path.length;
+      }
+
+      continue;
+    }
+
+    defender.position = {
+      x: defender.position.x + (dx / distance) * maxStepDistance,
+      y: defender.position.y + (dy / distance) * maxStepDistance,
+    };
+    moved = true;
+  }
+
+  if (moved) {
+    touchGameState(game);
+  }
+
+  return moved;
+}
+
 function emitGameList(channel) {
   channel.emit("game-list", Array.from(games.values(), serializeGameListItem));
 }
@@ -168,9 +434,20 @@ function broadcastGameList() {
   io.emit("game-list", Array.from(games.values(), serializeGameListItem));
 }
 
-function emitGameState(game) {
+function emitGameSnapshots(game) {
   for (const player of game.players.values()) {
-    player.channel.emit("game-state", serializeGameState(game, player.id));
+    emitGameSnapshotToChannel(player.channel, game, player.id);
+  }
+}
+
+function tickRealtimeGames() {
+  for (const game of games.values()) {
+    if (game.players.size === 0) {
+      continue;
+    }
+
+    moveFlagSeekers(game, SNAPSHOT_INTERVAL_MS / 1000);
+    emitGameSnapshots(game);
   }
 }
 
@@ -201,7 +478,7 @@ function updateGameReadiness(game) {
       game.state.countdownRemaining !== null
     ) {
       setGamePhase(game, "waiting", null);
-      emitGameState(game);
+      emitGameSnapshots(game);
     }
     return;
   }
@@ -215,7 +492,7 @@ function updateGameReadiness(game) {
   }
 
   setGamePhase(game, "waiting", null);
-  emitGameState(game);
+  emitGameSnapshots(game);
 
   game.countdownDelayTimer = setTimeout(() => {
     game.countdownDelayTimer = null;
@@ -226,7 +503,7 @@ function updateGameReadiness(game) {
 
     let remaining = PRE_GAME_COUNTDOWN_SECONDS;
     setGamePhase(game, "countdown", remaining);
-    emitGameState(game);
+    emitGameSnapshots(game);
 
     game.countdownIntervalTimer = setInterval(() => {
       if (!games.has(game.id) || game.players.size < MIN_PLAYERS_TO_START) {
@@ -239,12 +516,12 @@ function updateGameReadiness(game) {
       if (remaining <= 0) {
         clearCountdownTimer(game);
         setGamePhase(game, "live", 0);
-        emitGameState(game);
+        emitGameSnapshots(game);
         return;
       }
 
       setGamePhase(game, "countdown", remaining);
-      emitGameState(game);
+      emitGameSnapshots(game);
     }, 1000);
   }, 1000);
 }
@@ -313,8 +590,9 @@ function removeChannelFromGame(channel) {
       game.host = nextHost?.name ?? "Host";
     }
 
+    recalculateFlagSeekerPaths(game);
     touchGameState(game);
-    emitGameState(game);
+    emitGameSnapshots(game);
     updateGameReadiness(game);
   }
 
@@ -372,9 +650,10 @@ function joinGameInstance(channel, payload = {}) {
     name: game.name,
     game: serializeGameDetails(game, channel.id),
     playerId: channel.id,
+    playerSlot: getPlayerSlot(game, channel.id),
   });
 
-  emitGameState(game);
+  emitGameSnapshots(game);
   broadcastGameList();
 }
 
@@ -414,11 +693,18 @@ function addDefender(channel, payload = {}) {
     ownerId: channel.id,
     unitType,
     position: canonicalPosition,
+    targetPosition:
+      unitType === "flagSeeker"
+        ? getTargetFlagPositionForPlayer(game, channel.id)
+        : null,
+    path: [],
+    pathIndex: 0,
     createdAt: now(),
   });
 
+  recalculateFlagSeekerPaths(game);
   touchGameState(game);
-  emitGameState(game);
+  emitGameSnapshots(game);
 }
 
 app.get("/health", async () => {
@@ -519,7 +805,7 @@ io.onConnection((channel) => {
       return;
     }
 
-    channel.emit("game-state", serializeGameState(requestedGame, channel.id));
+    emitGameSnapshotToChannel(channel, requestedGame, channel.id);
   });
 
   channel.on("place-defender", (payload) => {
@@ -549,6 +835,8 @@ const start = async () => {
       server.once("listening", onListening);
       server.listen(PORT, "0.0.0.0");
     });
+
+    setInterval(tickRealtimeGames, SNAPSHOT_INTERVAL_MS);
 
     app.log.info(`Server listening on port ${PORT}`);
   } catch (error) {
