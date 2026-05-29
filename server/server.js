@@ -7,8 +7,14 @@ import {
   ARENA_HEIGHT,
   ARENA_WIDTH,
   COUNTDOWN_NONE,
+  CARRYING_FLAG_NO,
+  CARRYING_FLAG_YES,
   ENTITY_KIND_DEFENDER,
   ENTITY_KIND_MATCH,
+  FLAG_DROPPED_NO,
+  FLAG_DROPPED_YES,
+  FLAG_STATE_AT_BASE,
+  FLAG_STATE_EMPTY,
   FLAG_SEEKER_SPEED,
   MATCH_ENTITY_ID,
   PATH_GRID_CELL_SIZE,
@@ -17,6 +23,7 @@ import {
   PLAYER_SLOT_NONE,
   SNAPSHOT_SERVER_FPS,
   UNIT_TYPE_NONE,
+  UNIT_SPRITE_SIZE,
   encodeCountdown,
   encodePhase,
   encodeUnitType,
@@ -31,7 +38,13 @@ const DEFAULT_MAX_PLAYERS = 2;
 const MAX_MAX_PLAYERS = 2;
 const MIN_PLAYERS_TO_START = 2;
 const PRE_GAME_COUNTDOWN_SECONDS = 3;
-const SNAPSHOT_INTERVAL_MS = Math.max(1, Math.floor(1000 / SNAPSHOT_SERVER_FPS));
+const MAX_UNITS_PER_PLAYER = 10;
+const DEFENDER_CHASE_SPEED = 150;
+const DEFENDER_COLLISION_DISTANCE = UNIT_SPRITE_SIZE / 2;
+const SNAPSHOT_INTERVAL_MS = Math.max(
+  1,
+  Math.floor(1000 / SNAPSHOT_SERVER_FPS),
+);
 const PATH_GRID_COLUMNS = Math.ceil(ARENA_WIDTH / PATH_GRID_CELL_SIZE);
 const PATH_GRID_ROWS = Math.ceil(ARENA_HEIGHT / PATH_GRID_CELL_SIZE);
 const pathFinder = new PF.AStarFinder({
@@ -120,6 +133,10 @@ function createGameId() {
 function createGameState() {
   return {
     defenders: [],
+    hostFlagAtBase: true,
+    guestFlagAtBase: true,
+    hostDroppedFlagPosition: null,
+    guestDroppedFlagPosition: null,
     phase: "waiting",
     countdownRemaining: null,
     updatedAt: now(),
@@ -199,11 +216,41 @@ function getPlayerSlot(game, playerId) {
 }
 
 function createMatchSnapshotEntity(game, viewerPlayerId = null) {
+  const isGuestPerspective =
+    viewerPlayerId && game.hostPlayerId && viewerPlayerId !== game.hostPlayerId;
+  const hostDroppedFlagPosition = game.state.hostDroppedFlagPosition
+    ? isGuestPerspective
+      ? mirrorPosition(game.state.hostDroppedFlagPosition)
+      : game.state.hostDroppedFlagPosition
+    : null;
+  const guestDroppedFlagPosition = game.state.guestDroppedFlagPosition
+    ? isGuestPerspective
+      ? mirrorPosition(game.state.guestDroppedFlagPosition)
+      : game.state.guestDroppedFlagPosition
+    : null;
+
   return {
     id: MATCH_ENTITY_ID,
     kind: ENTITY_KIND_MATCH,
     ownerSlot: getPlayerSlot(game, viewerPlayerId),
     unitType: UNIT_TYPE_NONE,
+    carryingFlag: CARRYING_FLAG_NO,
+    hostFlagState: game.state.hostFlagAtBase
+      ? FLAG_STATE_AT_BASE
+      : FLAG_STATE_EMPTY,
+    guestFlagState: game.state.guestFlagAtBase
+      ? FLAG_STATE_AT_BASE
+      : FLAG_STATE_EMPTY,
+    hostDroppedFlagPresent: hostDroppedFlagPosition
+      ? FLAG_DROPPED_YES
+      : FLAG_DROPPED_NO,
+    guestDroppedFlagPresent: guestDroppedFlagPosition
+      ? FLAG_DROPPED_YES
+      : FLAG_DROPPED_NO,
+    hostDroppedFlagX: hostDroppedFlagPosition?.x ?? 0,
+    hostDroppedFlagY: hostDroppedFlagPosition?.y ?? 0,
+    guestDroppedFlagX: guestDroppedFlagPosition?.x ?? 0,
+    guestDroppedFlagY: guestDroppedFlagPosition?.y ?? 0,
     players: game.players.size,
     maxPlayers: game.maxPlayers,
     phase: encodePhase(game.state.phase),
@@ -228,6 +275,15 @@ function createDefenderSnapshotEntity(game, defender, viewerPlayerId = null) {
     kind: ENTITY_KIND_DEFENDER,
     ownerSlot: getPlayerSlot(game, defender.ownerId),
     unitType: encodeUnitType(defender.unitType),
+    carryingFlag: defender.carryingFlag ? CARRYING_FLAG_YES : CARRYING_FLAG_NO,
+    hostFlagState: FLAG_STATE_AT_BASE,
+    guestFlagState: FLAG_STATE_AT_BASE,
+    hostDroppedFlagPresent: FLAG_DROPPED_NO,
+    guestDroppedFlagPresent: FLAG_DROPPED_NO,
+    hostDroppedFlagX: 0,
+    hostDroppedFlagY: 0,
+    guestDroppedFlagX: 0,
+    guestDroppedFlagY: 0,
     players: 0,
     maxPlayers: 0,
     phase: 0,
@@ -284,6 +340,70 @@ function getTargetFlagPositionForPlayer(game, ownerId) {
   return getPlayerSlot(game, ownerId) === PLAYER_SLOT_HOST
     ? getGuestFlagPosition()
     : getHostFlagPosition();
+}
+
+function getHomeFlagPositionForPlayer(game, ownerId) {
+  return getPlayerSlot(game, ownerId) === PLAYER_SLOT_HOST
+    ? getHostFlagPosition()
+    : getGuestFlagPosition();
+}
+
+function getEnemyFlagSlotForPlayer(game, ownerId) {
+  return getPlayerSlot(game, ownerId) === PLAYER_SLOT_HOST
+    ? PLAYER_SLOT_GUEST
+    : PLAYER_SLOT_HOST;
+}
+
+function getFlagAtBaseBySlot(game, flagSlot) {
+  if (flagSlot === PLAYER_SLOT_HOST) {
+    return game.state.hostFlagAtBase;
+  }
+
+  return game.state.guestFlagAtBase;
+}
+
+function setFlagAtBaseBySlot(game, flagSlot, atBase) {
+  if (flagSlot === PLAYER_SLOT_HOST) {
+    game.state.hostFlagAtBase = atBase;
+    return;
+  }
+
+  game.state.guestFlagAtBase = atBase;
+}
+
+function getDroppedFlagPositionBySlot(game, flagSlot) {
+  if (flagSlot === PLAYER_SLOT_HOST) {
+    return game.state.hostDroppedFlagPosition;
+  }
+
+  return game.state.guestDroppedFlagPosition;
+}
+
+function setDroppedFlagPositionBySlot(game, flagSlot, position) {
+  if (flagSlot === PLAYER_SLOT_HOST) {
+    game.state.hostDroppedFlagPosition = position
+      ? { x: position.x, y: position.y }
+      : null;
+    return;
+  }
+
+  game.state.guestDroppedFlagPosition = position
+    ? { x: position.x, y: position.y }
+    : null;
+}
+
+function getFlagPickupTargetPositionForPlayer(game, ownerId) {
+  const enemyFlagSlot = getEnemyFlagSlotForPlayer(game, ownerId);
+  return (
+    getDroppedFlagPositionBySlot(game, enemyFlagSlot) ??
+    getTargetFlagPositionForPlayer(game, ownerId)
+  );
+}
+
+function countUnitsForPlayer(game, playerId) {
+  return game.state.defenders.filter(
+    (defender) => defender.ownerId === playerId,
+  ).length;
 }
 
 function buildPathGrid(game, currentSeekerId = null) {
@@ -347,9 +467,86 @@ function recalculateFlagSeekerPaths(game) {
       continue;
     }
 
+    defender.targetPosition = defender.carryingFlag
+      ? getHomeFlagPositionForPlayer(game, defender.ownerId)
+      : getFlagPickupTargetPositionForPlayer(game, defender.ownerId);
+
+    if (!defender.targetPosition) {
+      defender.path = [];
+      defender.pathIndex = 0;
+      continue;
+    }
+
     defender.path = buildWorldPath(game, defender);
     defender.pathIndex = 0;
   }
+}
+
+function distanceBetween(a, b) {
+  const dx = Number(a.x) - Number(b.x);
+  const dy = Number(a.y) - Number(b.y);
+  return Math.hypot(dx, dy);
+}
+
+function handleFlagSeekerFlagTransitions(game) {
+  let changed = false;
+
+  for (const defender of game.state.defenders) {
+    if (defender.unitType !== "flagSeeker") {
+      continue;
+    }
+
+    if (defender.carryingFlag) {
+      const homeFlagPosition = getHomeFlagPositionForPlayer(game, defender.ownerId);
+      if (distanceBetween(defender.position, homeFlagPosition) > DEFENDER_COLLISION_DISTANCE) {
+        continue;
+      }
+
+      if (defender.carriedFlagSlot !== PLAYER_SLOT_NONE) {
+        setFlagAtBaseBySlot(game, defender.carriedFlagSlot, true);
+        setDroppedFlagPositionBySlot(game, defender.carriedFlagSlot, null);
+      }
+
+      defender.carryingFlag = false;
+      defender.carriedFlagSlot = PLAYER_SLOT_NONE;
+      defender.targetPosition = null;
+      defender.path = [];
+      defender.pathIndex = 0;
+      changed = true;
+      continue;
+    }
+
+    const enemyFlagSlot = getEnemyFlagSlotForPlayer(game, defender.ownerId);
+    const droppedEnemyFlagPosition = getDroppedFlagPositionBySlot(
+      game,
+      enemyFlagSlot,
+    );
+    if (!getFlagAtBaseBySlot(game, enemyFlagSlot) && !droppedEnemyFlagPosition) {
+      continue;
+    }
+
+    const enemyFlagPosition =
+      droppedEnemyFlagPosition ??
+      getTargetFlagPositionForPlayer(game, defender.ownerId);
+    if (distanceBetween(defender.position, enemyFlagPosition) > DEFENDER_COLLISION_DISTANCE) {
+      continue;
+    }
+
+    setFlagAtBaseBySlot(game, enemyFlagSlot, false);
+    setDroppedFlagPositionBySlot(game, enemyFlagSlot, null);
+    defender.carryingFlag = true;
+    defender.carriedFlagSlot = enemyFlagSlot;
+    defender.targetPosition = getHomeFlagPositionForPlayer(game, defender.ownerId);
+    defender.path = buildWorldPath(game, defender);
+    defender.pathIndex = 0;
+    changed = true;
+  }
+
+  if (changed) {
+    touchGameState(game);
+  }
+
+  return changed;
 }
 
 function moveFlagSeekers(game, deltaSeconds) {
@@ -426,6 +623,137 @@ function moveFlagSeekers(game, deltaSeconds) {
   return moved;
 }
 
+function findNearestEnemyUnit(game, defender) {
+  let nearestEnemy = null;
+  let nearestDistance = Number.POSITIVE_INFINITY;
+
+  for (const candidate of game.state.defenders) {
+    if (
+      candidate.id === defender.id ||
+      candidate.ownerId === defender.ownerId
+    ) {
+      continue;
+    }
+
+    const dx = candidate.position.x - defender.position.x;
+    const dy = candidate.position.y - defender.position.y;
+    const distance = Math.hypot(dx, dy);
+
+    if (distance < nearestDistance) {
+      nearestDistance = distance;
+      nearestEnemy = candidate;
+    }
+  }
+
+  return nearestEnemy;
+}
+
+function moveDefenders(game, deltaSeconds) {
+  if (game.state.phase !== "live") {
+    return false;
+  }
+
+  let moved = false;
+  const maxStepDistance = DEFENDER_CHASE_SPEED * deltaSeconds;
+
+  for (const defender of game.state.defenders) {
+    if (defender.unitType !== "defender") {
+      continue;
+    }
+
+    const nearestEnemy = findNearestEnemyUnit(game, defender);
+    if (!nearestEnemy) {
+      continue;
+    }
+
+    const dx = nearestEnemy.position.x - defender.position.x;
+    const dy = nearestEnemy.position.y - defender.position.y;
+    const distance = Math.hypot(dx, dy);
+
+    if (distance === 0) {
+      continue;
+    }
+
+    if (distance <= maxStepDistance) {
+      defender.position = {
+        x: nearestEnemy.position.x,
+        y: nearestEnemy.position.y,
+      };
+      moved = true;
+      continue;
+    }
+
+    defender.position = {
+      x: defender.position.x + (dx / distance) * maxStepDistance,
+      y: defender.position.y + (dy / distance) * maxStepDistance,
+    };
+    moved = true;
+  }
+
+  if (moved) {
+    touchGameState(game);
+  }
+
+  return moved;
+}
+
+function resolveDefenderCollisions(game) {
+  if (game.state.phase !== "live") {
+    return false;
+  }
+
+  const collidedUnitIds = new Set();
+
+  for (let i = 0; i < game.state.defenders.length; i += 1) {
+    const unitA = game.state.defenders[i];
+
+    for (let j = i + 1; j < game.state.defenders.length; j += 1) {
+      const unitB = game.state.defenders[j];
+
+      if (unitA.ownerId === unitB.ownerId) {
+        continue;
+      }
+
+      if (unitA.unitType !== "defender" && unitB.unitType !== "defender") {
+        continue;
+      }
+
+      const dx = unitA.position.x - unitB.position.x;
+      const dy = unitA.position.y - unitB.position.y;
+      const distance = Math.hypot(dx, dy);
+
+      if (distance <= DEFENDER_COLLISION_DISTANCE) {
+        collidedUnitIds.add(unitA.id);
+        collidedUnitIds.add(unitB.id);
+      }
+    }
+  }
+
+  if (collidedUnitIds.size === 0) {
+    return false;
+  }
+
+  for (const defender of game.state.defenders) {
+    if (
+      collidedUnitIds.has(defender.id) &&
+      defender.carryingFlag &&
+      defender.carriedFlagSlot !== PLAYER_SLOT_NONE
+    ) {
+      setFlagAtBaseBySlot(game, defender.carriedFlagSlot, false);
+      setDroppedFlagPositionBySlot(game, defender.carriedFlagSlot, {
+        x: defender.position.x,
+        y: defender.position.y,
+      });
+    }
+  }
+
+  game.state.defenders = game.state.defenders.filter(
+    (defender) => !collidedUnitIds.has(defender.id),
+  );
+  touchGameState(game);
+  return true;
+}
+
 function emitGameList(channel) {
   channel.emit("game-list", Array.from(games.values(), serializeGameListItem));
 }
@@ -446,7 +774,19 @@ function tickRealtimeGames() {
       continue;
     }
 
-    moveFlagSeekers(game, SNAPSHOT_INTERVAL_MS / 1000);
+    const defendersMoved = moveDefenders(game, SNAPSHOT_INTERVAL_MS / 1000);
+    const collisionsAfterDefenderMove = resolveDefenderCollisions(game);
+    if (defendersMoved || collisionsAfterDefenderMove) {
+      recalculateFlagSeekerPaths(game);
+    }
+
+    const seekersMoved = moveFlagSeekers(game, SNAPSHOT_INTERVAL_MS / 1000);
+    const flagTransitionsAfterSeekerMove = handleFlagSeekerFlagTransitions(game);
+    const collisionsAfterSeekerMove = resolveDefenderCollisions(game);
+    if (seekersMoved || flagTransitionsAfterSeekerMove || collisionsAfterSeekerMove) {
+      recalculateFlagSeekerPaths(game);
+    }
+
     emitGameSnapshots(game);
   }
 }
@@ -682,11 +1022,16 @@ function addDefender(channel, payload = {}) {
     return;
   }
 
+  if (countUnitsForPlayer(game, channel.id) >= MAX_UNITS_PER_PLAYER) {
+    channel.emit("game-error", {
+      message: `Unit limit reached (${MAX_UNITS_PER_PLAYER})`,
+    });
+    return;
+  }
+
   const playerIsGuest =
     game.hostPlayerId !== null && channel.id !== game.hostPlayerId;
-  const canonicalPosition = playerIsGuest
-    ? mirrorPosition({ x, y })
-    : { x, y };
+  const canonicalPosition = playerIsGuest ? mirrorPosition({ x, y }) : { x, y };
 
   game.state.defenders.push({
     id: "DEF-" + Math.random().toString(36).substring(2, 10).toUpperCase(),
@@ -695,8 +1040,10 @@ function addDefender(channel, payload = {}) {
     position: canonicalPosition,
     targetPosition:
       unitType === "flagSeeker"
-        ? getTargetFlagPositionForPlayer(game, channel.id)
+        ? getFlagPickupTargetPositionForPlayer(game, channel.id)
         : null,
+    carryingFlag: false,
+    carriedFlagSlot: PLAYER_SLOT_NONE,
     path: [],
     pathIndex: 0,
     createdAt: now(),

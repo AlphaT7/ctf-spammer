@@ -6,6 +6,7 @@ import * as LJS from "littlejsengine";
 import {
   ARENA_HEIGHT,
   ARENA_WIDTH,
+  PLAYER_SLOT_GUEST,
   PLAYER_SLOT_NONE,
   SNAPSHOT_SERVER_FPS,
   decodeGameSnapshot,
@@ -67,6 +68,11 @@ const unitSpriteMap = {
   enemyFlagDefender: vec2(0, 40),
   playerFlagSeeker: vec2(40, 40),
   enemyFlagSeeker: vec2(0, 0),
+  playerFlagSeekerWFlag: vec2(80, 40),
+  enemyFlagSeekerWFlag: vec2(120, 40),
+  emptyFlagSlot: vec2(80, 80),
+  movedPlayerFlagSlot: vec2(80, 0),
+  movedEnemyFlagSlot: vec2(120, 0),
 };
 
 class BaseSprite {
@@ -170,19 +176,27 @@ function createPlacedUnitSprite(defender) {
     currentPlayerSlot !== PLAYER_SLOT_NONE &&
     defender.ownerSlot === currentPlayerSlot;
   const isFlagSeeker = defender.unitType === "flagSeeker";
+  const isCarryingFlag = defender.carryingFlag === true;
 
-  let sprite;
+  let sourcePos;
 
   if (isFlagSeeker) {
-    sprite = isOwnedByCurrentPlayer
-      ? new PlayerFlagSeekerSprite(position)
-      : new EnemyFlagSeekerSprite(position);
+    if (isCarryingFlag) {
+      sourcePos = isOwnedByCurrentPlayer
+        ? unitSpriteMap.playerFlagSeekerWFlag
+        : unitSpriteMap.enemyFlagSeekerWFlag;
+    } else {
+      sourcePos = isOwnedByCurrentPlayer
+        ? unitSpriteMap.playerFlagSeeker
+        : unitSpriteMap.enemyFlagSeeker;
+    }
   } else {
-    sprite = isOwnedByCurrentPlayer
-      ? new PlayerFlagDefenderSprite(position)
-      : new EnemyFlagDefenderSprite(position);
+    sourcePos = isOwnedByCurrentPlayer
+      ? unitSpriteMap.playerFlagDefender
+      : unitSpriteMap.enemyFlagDefender;
   }
 
+  const sprite = new BaseSprite(sourcePos, position);
   sprite.createTileInfo(spriteTexture);
   return sprite;
 }
@@ -243,23 +257,61 @@ function emitUnitPlacement(unitType, position) {
   });
 }
 
-function createFlagSprites() {
-  const topCenter = vec2(
-    getGuestFlagPosition().x,
-    getGuestFlagPosition().y,
-  );
-  const bottomCenter = vec2(
-    getHostFlagPosition().x,
-    getHostFlagPosition().y,
-  );
+function createFlagSprites(matchState) {
+  const topCenter = vec2(getGuestFlagPosition().x, getGuestFlagPosition().y);
+  const bottomCenter = vec2(getHostFlagPosition().x, getHostFlagPosition().y);
+  const topFlagAtBase =
+    currentPlayerSlot === PLAYER_SLOT_GUEST
+      ? matchState?.hostFlagAtBase
+      : matchState?.guestFlagAtBase;
+  const bottomFlagAtBase =
+    currentPlayerSlot === PLAYER_SLOT_GUEST
+      ? matchState?.guestFlagAtBase
+      : matchState?.hostFlagAtBase;
+  const topDroppedFlagPosition =
+    currentPlayerSlot === PLAYER_SLOT_GUEST
+      ? matchState?.hostDroppedFlagPosition
+      : matchState?.guestDroppedFlagPosition;
+  const bottomDroppedFlagPosition =
+    currentPlayerSlot === PLAYER_SLOT_GUEST
+      ? matchState?.guestDroppedFlagPosition
+      : matchState?.hostDroppedFlagPosition;
+  const topFlagSource =
+    topFlagAtBase === false
+      ? unitSpriteMap.emptyFlagSlot
+      : unitSpriteMap.playerFlag;
+  const bottomFlagSource =
+    bottomFlagAtBase === false
+      ? unitSpriteMap.emptyFlagSlot
+      : unitSpriteMap.enemyFlag;
 
-  const playerFlag = new PlayerFlagSprite(bottomCenter);
-  const enemyFlag = new EnemyFlagSprite(topCenter);
+  const playerFlag = new BaseSprite(topFlagSource, topCenter);
+  const enemyFlag = new BaseSprite(bottomFlagSource, bottomCenter);
 
   playerFlag.createTileInfo(spriteTexture);
   enemyFlag.createTileInfo(spriteTexture);
 
-  return [enemyFlag, playerFlag];
+  const sprites = [enemyFlag, playerFlag];
+
+  if (topDroppedFlagPosition) {
+    const movedTopFlag = new BaseSprite(
+      unitSpriteMap.movedPlayerFlagSlot,
+      vec2(topDroppedFlagPosition.x, topDroppedFlagPosition.y),
+    );
+    movedTopFlag.createTileInfo(spriteTexture);
+    sprites.push(movedTopFlag);
+  }
+
+  if (bottomDroppedFlagPosition) {
+    const movedBottomFlag = new BaseSprite(
+      unitSpriteMap.movedEnemyFlagSlot,
+      vec2(bottomDroppedFlagPosition.x, bottomDroppedFlagPosition.y),
+    );
+    movedBottomFlag.createTileInfo(spriteTexture);
+    sprites.push(movedBottomFlag);
+  }
+
+  return sprites;
 }
 
 function getMatchState(state) {
@@ -294,7 +346,7 @@ function syncRealtimeState(state) {
     return;
   }
 
-  const flagSprites = gameLive ? createFlagSprites() : [];
+  const flagSprites = gameLive ? createFlagSprites(matchState) : [];
   const defenderSprites = defenders.map((defender) =>
     createPlacedUnitSprite(defender),
   );
